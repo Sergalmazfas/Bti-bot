@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+.env
+.venv/
+
+# Docker
+*.log
+*.pid
+
+# OS
+.DS_Store
+
+# Secrets (never commit)
+secrets.json
+.env*
