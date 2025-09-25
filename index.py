@@ -1,58 +1,69 @@
 import os
 import json
-import logging
-import urllib.request
-import urllib.parse
-import ssl
 import time
+from typing import Any, Dict
+from utils.validation import is_valid_cadastral
+from services.registry_client import get_registry_data
+from services.serp_client import get_market_aggregates
+from services.pricing_engine import calculate_prices
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
-user_data = {}
-
-try:
-    import certifi
-except Exception:
-    certifi = None
-
-def handler(event, context):
-    secrets = {
-        'BOT_TOKEN': bool(os.getenv('BOT_TOKEN')),
-        'USER_ID': bool(os.getenv('USER_ID')),
-        'REESTR_API_TOKEN': bool(os.getenv('REESTR_API_TOKEN')),
-        'SERPRIVER_API_KEY': bool(os.getenv('SERPRIVER_API_KEY')),
+def _json_response(status_code: int, payload: Dict[str, Any]):
+    return {
+        "statusCode": status_code,
+        "headers": {"Content-Type": "application/json"},
+        "body": json.dumps(payload, ensure_ascii=False)
     }
-    return {'statusCode': 200, 'body': json.dumps({'secrets_present': secrets})}
 
-def _ssl_context():
-    """Build SSL context with the following priority:
-    1) CA_BUNDLE_PEM env contains PEM content (use it)
-    2) CA_BUNDLE_PATH env points to a PEM file (use it)
-    3) certifi bundle if available
-    4) system defaults
-    """
-    ca_pem = os.getenv('CA_BUNDLE_PEM')
-    ca_path = os.getenv('CA_BUNDLE_PATH')
 
-    if ca_pem:
-        tmp_path = '/tmp/custom_ca_bundle.pem'
-        try:
-            with open(tmp_path, 'w') as f:
-                f.write(ca_pem)
-            return ssl.create_default_context(cafile=tmp_path)
-        except Exception as e:
-            logger.error(f"Failed to write CA_BUNDLE_PEM: {e}")
+def handler(event: Dict[str, Any], context: Any):
+    start = time.time()
+    try:
+        body = event.get("body") if isinstance(event, dict) else None
+        if isinstance(body, (bytes, bytearray)):
+            body = body.decode("utf-8", errors="ignore")
+        if isinstance(body, str):
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError:
+                data = {}
+        elif isinstance(event, dict) and "message" in event:
+            data = event  # allow direct Telegram-like payload for local tests
+        else:
+            data = {}
 
-    if ca_path and os.path.exists(ca_path):
-        try:
-            return ssl.create_default_context(cafile=ca_path)
-        except Exception as e:
-            logger.error(f"Failed to load CA_BUNDLE_PATH: {e}")
+        # Extract cadastral number from text or explicit field
+        text = (
+            data.get("message", {}).get("text")
+            if isinstance(data.get("message"), dict)
+            else data.get("text")
+        )
+        cadnum = data.get("cadastral_number") or (text.strip() if isinstance(text, str) else None)
 
-    if certifi is not None:
-        return ssl.create_default_context(cafile=certifi.where())
-    return ssl.create_default_context()
+        if not cadnum or not is_valid_cadastral(cadnum):
+            return _json_response(400, {"error": "Некорректный кадастровый номер", "hint": "Формат XX:XX:XXXXXXX:XXXX"})
 
-if __name__ == '__main__':
-    print(handler({}, None))
+        # Fetch official registry data
+        reg = get_registry_data(cadnum)
+        # Fetch market aggregates via SERP/Avito
+        market = get_market_aggregates(reg)
+        # Calculate 3 prices
+        prices = calculate_prices(registry_data=reg, market_data=market)
+
+        elapsed_ms = int((time.time() - start) * 1000)
+        return _json_response(200, {
+            "cadnum": cadnum,
+            "bti": {
+                "area_m2": reg.get("area_m2"),
+                "floors": reg.get("floors"),
+                "walls": reg.get("walls"),
+                "year_built": reg.get("year_built"),
+                "cadastral_value": reg.get("cadastral_value"),
+                "address": reg.get("address"),
+            },
+            "market": market,
+            "prices": prices,
+            "meta": {"elapsed_ms": elapsed_ms}
+        })
+    except Exception as e:
+        return _json_response(500, {"error": str(e)})
