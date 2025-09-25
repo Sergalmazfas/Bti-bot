@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import logging
+import asyncio
 import sqlite3
 import re
 import requests
@@ -146,7 +147,7 @@ class EnhancedDatabase:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 'Moscow', 1500.0, 1.0, 0.5, 1.1, 1.0, 1.0,
-                'coefficients_db_v2025-09-22', datetime.now().isoformat(),
+                'coefficients_db_v2025-09-22', "2025-09-25T00:00:00",
                 'Default coefficients for Moscow region'
             ))
         
@@ -891,32 +892,6 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик ошибок"""
     logger.warning(f'Update {update} caused error {context.error}')
 
-def main():
-    """Основная функция"""
-    print("🤖 Бот запущен с полной системой БТИ!")
-    
-    # Создание приложения
-    app = Application.builder().token(BOT_TOKEN).build()
-    
-    # Добавление обработчиков
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(order_measurement, pattern="^order_measurement$"))
-    app.add_handler(CallbackQueryHandler(process_search_type, pattern="^search_"))
-    app.add_handler(CallbackQueryHandler(process_room_type, pattern="^room_type_"))
-    app.add_handler(CallbackQueryHandler(process_materials, pattern="^material_"))
-    app.add_handler(CallbackQueryHandler(process_urgent_option, pattern="^urgent_"))
-    app.add_handler(CallbackQueryHandler(show_contacts, pattern="^show_contacts$"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_error_handler(error_handler)
-    
-    # Запуск бота
-    app.run_polling()
-
-if __name__ == '__main__':
-    main()
-
-
-# Flask webhook для Cloud Run
 from flask import Flask, request, jsonify
 import os
 
@@ -927,7 +902,10 @@ application = None
 
 def main():
     """Основная функция запуска бота"""
-    global application
+    global application, db
+    
+    # Инициализация базы данных
+    db = EnhancedDatabase()
     
     # Инициализация бота
     application = Application.builder().token(os.environ.get('BOT_TOKEN')).build()
@@ -944,24 +922,27 @@ def main():
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({'status': 'ok'}), 200
-
-@app.route('/', methods=['POST'])
+@app.route("/", methods=["POST"])
 def webhook():
     """Webhook для Cloud Run"""
     try:
         # Ленивая инициализация бота при первом запросе
-        global application
+        global application, db
+        
+        # Инициализация базы данных
+        db = EnhancedDatabase()
+        
         if application is None:
-            logger.info('🚀 Инициализация BTI Bot при первом запросе...')
+            logger.info("🚀 Инициализация BTI Bot при первом запросе...")
             main()  # Инициализируем бота только при первом запросе
             
         # Проверяем, что application инициализирован
         if application is None:
-            logger.error('Application not initialized')
+            logger.error("Application not initialized")
             return jsonify({"error": "Application not initialized"}), 500
             
         update = Update.de_json(request.get_json(), application.bot)
-        application.process_update(update)
+        asyncio.run(application.process_update(update))
         return jsonify({"status": "ok"})
     except Exception as e:
         logger.error(f"Webhook error: {e}")
