@@ -1,7 +1,8 @@
 import json
 import os
 from flask import Flask, request, jsonify
-import index  # our module with handler(event, context)
+import main  # PTB webhook flow
+import index  # JSON cadastral flow (junior implementation)
 
 app = Flask(__name__)
 
@@ -11,17 +12,23 @@ def health():
 
 @app.route('/', methods=['POST'])
 def webhook():
-    # Cloud Run HTTP handler adapts to our Yandex-like handler(event, context)
-    body_bytes = request.get_data() or b''
     try:
-        body_str = body_bytes.decode('utf-8')
-    except Exception:
-        body_str = ''
-    event = {'body': body_str}
-    result = index.handler(event, None)  # context is not used
-    status = result.get('statusCode', 200)
-    body = result.get('body', 'OK')
-    return body, status, {'Content-Type': 'application/json'}
+        payload = request.get_json(silent=True) or {}
+        # Dual-mode routing: JSON cadastral flow vs Telegram/PTB flow
+        if isinstance(payload, dict) and 'cadastral_number' in payload:
+            event = {'body': json.dumps(payload, ensure_ascii=False)}
+            resp = index.handler(event, None)
+            status = resp.get('statusCode', 200)
+            headers = resp.get('headers', {"Content-Type": "application/json"})
+            body = resp.get('body', '{}')
+            return body, status, headers
+        # Otherwise delegate to PTB webhook in main.py
+        result = main.webhook()
+        if isinstance(result, tuple):
+            return result
+        return result
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', '8080')))
