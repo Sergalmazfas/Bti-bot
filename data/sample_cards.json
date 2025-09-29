@@ -1,0 +1,19 @@
+{
+  "cadastral_number": "77:09:0001013:1087",
+  "rosreestr": {
+    "address": "Российская Федерация, город Москва, Ховрино, ул. Фестивальная, д. 28, стр. 1",
+    "area": 2797.5,
+    "room_type": "Нежилое",
+    "materials": "Кирпичные",
+    "build_year": 1976,
+    "region_code": "77",
+    "tariffs_per_m2": {"measurements": 50, "techpassport": 250, "techassignment": 250}
+  },
+  "market": {
+    "price_per_m2": 180,
+    "final_price_per_m2": 241.56
+  },
+  "recommendation": {
+    "price": 1101655
+  }
+}

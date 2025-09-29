@@ -1,0 +1,31 @@
+{
+  "example_cadastral": "77:09:0001013:1087",
+  "bti_card": {
+    "address": "Российская Федерация, город Москва, вн.тер.г. муниципальный округ Ховрино, улица Фестивальная, дом 28, строение 1",
+    "area": 2797.5,
+    "room_type": "Нежилое",
+    "materials": "Кирпичные",
+    "build_year": 1976,
+    "region_code": "77",
+    "tariffs": {
+      "measurements_per_m2": 50,
+      "techpassport_per_m2": 250,
+      "techassignment_per_m2": 250
+    },
+    "calculations": {
+      "measurements": 139875,
+      "techpassport": 699375,
+      "techassignment": 699375,
+      "total": 1538625
+    }
+  },
+  "market_card": {
+    "price_per_m2": 180,
+    "final_price_per_m2": 241.56,
+    "total": 675000
+  },
+  "recommendation_card": {
+    "price": 1107194.55,
+    "price_per_m2": 396
+  }
+}
