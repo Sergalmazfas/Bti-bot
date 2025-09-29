@@ -23,7 +23,7 @@ class ForgeService:
         """Загружает секреты из Google Secret Manager"""
         try:
             client = secretmanager.SecretManagerServiceClient()
-            project_id = os.getenv('GOOGLE_CLOUD_PROJECT', 'talkhint')
+            project_id = os.getenv('GOOGLE_CLOUD_PROJECT', 'swiftchair')
             
             # Получаем ForgeClientID
             name_id = f"projects/{project_id}/secrets/ForgeClientID/versions/latest"
@@ -55,8 +55,7 @@ class ForgeService:
             return self.access_token
             
         try:
-            # ИСПРАВЛЕННЫЙ URL для аутентификации
-            url = "https://developer.api.autodesk.com/authentication/v2/token"
+            url = "https://developer.api.autodesk.com/authentication/v1/authenticate"
             data = {
                 'client_id': self.client_id,
                 'client_secret': self.client_secret,
