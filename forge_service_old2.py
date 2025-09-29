@@ -72,8 +72,7 @@ class ForgeService:
             logger.info(f"Authentication response status: {response.status_code}")
             
             if response.status_code != 200:
-                logger.error(f"Authentication failed: {response.status_code}")
-                logger.error(f"Response: {response.text}")
+                logger.error(f"Authentication failed: {response.status_code} - {response.text}")
                 raise Exception(f"Authentication failed: {response.status_code}")
             
             token_data = response.json()
@@ -87,53 +86,16 @@ class ForgeService:
             logger.error(f"Failed to get Forge access token: {e}")
             raise
     
-    def upload_file_to_forge(self, file_path: str, object_name: str) -> Optional[str]:
-        """Загружает файл в Forge OSS с правильным workflow"""
+    def _create_bucket(self, bucket_name: str) -> bool:
+        """Создает bucket в Forge если не существует"""
         try:
             token = self._get_access_token()
-            bucket_name = "btibot-forge-bucket"
-            
-            logger.info(f"Uploading file {file_path} to Forge bucket {bucket_name}")
-            
-            # Проверяем/создаем bucket
-            if not self._ensure_bucket_exists(bucket_name, token):
-                logger.error("Failed to ensure bucket exists")
-                return None
-            
-            # Получаем URL для загрузки (двухэтапный процесс)
-            upload_url = self._get_upload_url(bucket_name, object_name, token)
-            if not upload_url:
-                logger.error("Failed to get upload URL")
-                return None
-            
-            # Загружаем файл
-            logger.info(f"Uploading file to: {upload_url}")
-            with open(file_path, 'rb') as f:
-                file_content = f.read()
-                logger.info(f"File size: {len(file_content)} bytes")
-                
-                upload_response = requests.put(upload_url, data=file_content, timeout=60)
-                logger.info(f"Upload response: {upload_response.status_code}")
-                
-                if upload_response.status_code not in [200, 201]:
-                    logger.error(f"Upload failed: {upload_response.status_code} - {upload_response.text}")
-                    return None
-            
-            object_urn = f"urn:adsk.objects:os.object:{bucket_name}:{object_name}"
-            logger.info(f"File uploaded successfully: {object_urn}")
-            return object_urn
-            
-        except Exception as e:
-            logger.error(f"Failed to upload file to Forge: {e}")
-            return None
-    
-    def _ensure_bucket_exists(self, bucket_name: str, token: str) -> bool:
-        """Проверяет существование bucket и создает если нужно"""
-        try:
             headers = {
                 'Authorization': f'Bearer {token}',
                 'Content-Type': 'application/json'
             }
+            
+            logger.info(f"Checking if bucket {bucket_name} exists...")
             
             # Проверяем существование bucket
             url = f"https://developer.api.autodesk.com/oss/v2/buckets/{bucket_name}"
@@ -163,48 +125,49 @@ class ForgeService:
                 return False
             
         except Exception as e:
-            logger.error(f"Failed to ensure bucket exists: {e}")
+            logger.error(f"Failed to create bucket {bucket_name}: {e}")
             return False
     
-    def _get_upload_url(self, bucket_name: str, object_name: str, token: str) -> Optional[str]:
-        """Получает URL для загрузки файла (двухэтапный процесс)"""
+    def upload_file_to_forge(self, file_path: str, object_name: str) -> Optional[str]:
+        """Загружает файл в Forge OSS"""
         try:
+            token = self._get_access_token()
+            bucket_name = "btibot-forge-bucket"
+            
+            logger.info(f"Uploading file {file_path} to Forge bucket {bucket_name}")
+            
+            # Создаем bucket если нужно
+            if not self._create_bucket(bucket_name):
+                logger.error("Failed to create or access bucket")
+                return None
+            
+            # Получаем URL для загрузки
             headers = {
                 'Authorization': f'Bearer {token}',
-                'Content-Type': 'application/json'
+                'Content-Type': 'application/octet-stream'
             }
             
-            # Шаг 1: Получаем URL для загрузки
             url = f"https://developer.api.autodesk.com/oss/v2/buckets/{bucket_name}/objects/{object_name}"
-            data = {
-                'bucketKey': bucket_name,
-                'objectName': object_name
-            }
+            logger.info(f"Upload URL: {url}")
             
-            logger.info(f"Getting upload URL: {url}")
-            response = requests.post(url, headers=headers, json=data, timeout=30)
-            logger.info(f"Upload URL response: {response.status_code}")
+            # Загружаем файл
+            with open(file_path, 'rb') as f:
+                file_content = f.read()
+                logger.info(f"File size: {len(file_content)} bytes")
+                
+                upload_response = requests.put(url, data=file_content, headers=headers, timeout=60)
+                logger.info(f"Upload response: {upload_response.status_code}")
+                
+                if upload_response.status_code not in [200, 201]:
+                    logger.error(f"Upload failed: {upload_response.status_code} - {upload_response.text}")
+                    return None
             
-            if response.status_code in [200, 201]:
-                # В некоторых случаях Forge возвращает URL напрямую
-                if 'location' in response.headers:
-                    return response.headers['location']
-                elif response.text:
-                    try:
-                        data = response.json()
-                        if 'location' in data:
-                            return data['location']
-                    except:
-                        pass
-                
-                # Если нет location, используем тот же URL для PUT
-                return url
-            else:
-                logger.error(f"Failed to get upload URL: {response.status_code} - {response.text}")
-                return None
-                
+            object_urn = f"urn:adsk.objects:os.object:{bucket_name}:{object_name}"
+            logger.info(f"File uploaded successfully: {object_urn}")
+            return object_urn
+            
         except Exception as e:
-            logger.error(f"Failed to get upload URL: {e}")
+            logger.error(f"Failed to upload file to Forge: {e}")
             return None
     
     def convert_ifc_to_dwg(self, object_urn: str) -> Optional[str]:

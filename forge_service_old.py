@@ -36,7 +36,6 @@ class ForgeService:
             self.client_secret = response_secret.payload.data.decode("UTF-8")
             
             logger.info("Forge credentials loaded successfully")
-            logger.info(f"Client ID: {self.client_id[:10]}...")
         except Exception as e:
             logger.error(f"Failed to load Forge credentials: {e}")
             raise
@@ -56,7 +55,7 @@ class ForgeService:
             return self.access_token
             
         try:
-            logger.info("Requesting Forge access token...")
+            # ИСПРАВЛЕННЫЙ URL для аутентификации
             url = "https://developer.api.autodesk.com/authentication/v2/token"
             data = {
                 'client_id': self.client_id,
@@ -65,71 +64,22 @@ class ForgeService:
                 'scope': 'data:read data:write data:create bucket:create bucket:read'
             }
             
-            logger.info(f"Authentication URL: {url}")
-            logger.info(f"Client ID: {self.client_id[:10]}...")
-            
             response = requests.post(url, data=data, timeout=30)
-            logger.info(f"Authentication response status: {response.status_code}")
-            
-            if response.status_code != 200:
-                logger.error(f"Authentication failed: {response.status_code}")
-                logger.error(f"Response: {response.text}")
-                raise Exception(f"Authentication failed: {response.status_code}")
+            response.raise_for_status()
             
             token_data = response.json()
             self.access_token = token_data['access_token']
-            expires_in = token_data.get('expires_in', 3600)
-            
-            logger.info(f"Forge access token obtained, expires in {expires_in} seconds")
+            logger.info("Forge access token obtained")
             return self.access_token
             
         except Exception as e:
             logger.error(f"Failed to get Forge access token: {e}")
             raise
     
-    def upload_file_to_forge(self, file_path: str, object_name: str) -> Optional[str]:
-        """Загружает файл в Forge OSS с правильным workflow"""
+    def _create_bucket(self, bucket_name: str) -> bool:
+        """Создает bucket в Forge если не существует"""
         try:
             token = self._get_access_token()
-            bucket_name = "btibot-forge-bucket"
-            
-            logger.info(f"Uploading file {file_path} to Forge bucket {bucket_name}")
-            
-            # Проверяем/создаем bucket
-            if not self._ensure_bucket_exists(bucket_name, token):
-                logger.error("Failed to ensure bucket exists")
-                return None
-            
-            # Получаем URL для загрузки (двухэтапный процесс)
-            upload_url = self._get_upload_url(bucket_name, object_name, token)
-            if not upload_url:
-                logger.error("Failed to get upload URL")
-                return None
-            
-            # Загружаем файл
-            logger.info(f"Uploading file to: {upload_url}")
-            with open(file_path, 'rb') as f:
-                file_content = f.read()
-                logger.info(f"File size: {len(file_content)} bytes")
-                
-                upload_response = requests.put(upload_url, data=file_content, timeout=60)
-                logger.info(f"Upload response: {upload_response.status_code}")
-                
-                if upload_response.status_code not in [200, 201]:
-                    logger.error(f"Upload failed: {upload_response.status_code} - {upload_response.text}")
-                    return None
-            
-            object_urn = f"urn:adsk.objects:os.object:{bucket_name}:{object_name}"
-            logger.info(f"File uploaded successfully: {object_urn}")
-            return object_urn
-            
-        except Exception as e:
-            logger.error(f"Failed to upload file to Forge: {e}")
-            return None
-    
-    def _ensure_bucket_exists(self, bucket_name: str, token: str) -> bool:
-        """Проверяет существование bucket и создает если нужно"""
-        try:
             headers = {
                 'Authorization': f'Bearer {token}',
                 'Content-Type': 'application/json'
@@ -138,14 +88,12 @@ class ForgeService:
             # Проверяем существование bucket
             url = f"https://developer.api.autodesk.com/oss/v2/buckets/{bucket_name}"
             response = requests.get(url, headers=headers, timeout=30)
-            logger.info(f"Bucket check response: {response.status_code}")
             
             if response.status_code == 200:
                 logger.info(f"Bucket {bucket_name} already exists")
                 return True
             
             # Создаем bucket
-            logger.info(f"Creating bucket {bucket_name}...")
             url = "https://developer.api.autodesk.com/oss/v2/buckets"
             data = {
                 'bucketKey': bucket_name,
@@ -153,58 +101,42 @@ class ForgeService:
             }
             
             response = requests.post(url, headers=headers, json=data, timeout=30)
-            logger.info(f"Bucket creation response: {response.status_code}")
+            response.raise_for_status()
             
-            if response.status_code == 201:
-                logger.info(f"Bucket {bucket_name} created successfully")
-                return True
-            else:
-                logger.error(f"Failed to create bucket: {response.status_code} - {response.text}")
-                return False
+            logger.info(f"Bucket {bucket_name} created successfully")
+            return True
             
         except Exception as e:
-            logger.error(f"Failed to ensure bucket exists: {e}")
+            logger.error(f"Failed to create bucket {bucket_name}: {e}")
             return False
     
-    def _get_upload_url(self, bucket_name: str, object_name: str, token: str) -> Optional[str]:
-        """Получает URL для загрузки файла (двухэтапный процесс)"""
+    def upload_file_to_forge(self, file_path: str, object_name: str) -> Optional[str]:
+        """Загружает файл в Forge OSS"""
         try:
+            token = self._get_access_token()
+            bucket_name = "btibot-forge-bucket"
+            
+            # Создаем bucket если нужно
+            self._create_bucket(bucket_name)
+            
+            # Получаем URL для загрузки
             headers = {
                 'Authorization': f'Bearer {token}',
                 'Content-Type': 'application/json'
             }
             
-            # Шаг 1: Получаем URL для загрузки
             url = f"https://developer.api.autodesk.com/oss/v2/buckets/{bucket_name}/objects/{object_name}"
-            data = {
-                'bucketKey': bucket_name,
-                'objectName': object_name
-            }
             
-            logger.info(f"Getting upload URL: {url}")
-            response = requests.post(url, headers=headers, json=data, timeout=30)
-            logger.info(f"Upload URL response: {response.status_code}")
+            # Загружаем файл
+            with open(file_path, 'rb') as f:
+                upload_response = requests.put(url, data=f, headers=headers, timeout=60)
+                upload_response.raise_for_status()
             
-            if response.status_code in [200, 201]:
-                # В некоторых случаях Forge возвращает URL напрямую
-                if 'location' in response.headers:
-                    return response.headers['location']
-                elif response.text:
-                    try:
-                        data = response.json()
-                        if 'location' in data:
-                            return data['location']
-                    except:
-                        pass
-                
-                # Если нет location, используем тот же URL для PUT
-                return url
-            else:
-                logger.error(f"Failed to get upload URL: {response.status_code} - {response.text}")
-                return None
-                
+            logger.info(f"File uploaded to Forge: {object_name}")
+            return f"urn:adsk.objects:os.object:{bucket_name}:{object_name}"
+            
         except Exception as e:
-            logger.error(f"Failed to get upload URL: {e}")
+            logger.error(f"Failed to upload file to Forge: {e}")
             return None
     
     def convert_ifc_to_dwg(self, object_urn: str) -> Optional[str]:
@@ -215,8 +147,6 @@ class ForgeService:
                 'Authorization': f'Bearer {token}',
                 'Content-Type': 'application/json'
             }
-            
-            logger.info(f"Starting conversion for URN: {object_urn}")
             
             # Начинаем конвертацию
             url = "https://developer.api.autodesk.com/modelderivative/v2/designdata/job"
@@ -237,15 +167,8 @@ class ForgeService:
                 }
             }
             
-            logger.info(f"Conversion request URL: {url}")
-            logger.info(f"Conversion request data: {json.dumps(data, indent=2)}")
-            
             response = requests.post(url, headers=headers, json=data, timeout=30)
-            logger.info(f"Conversion response: {response.status_code}")
-            
-            if response.status_code not in [200, 201, 202]:
-                logger.error(f"Conversion request failed: {response.status_code} - {response.text}")
-                return None
+            response.raise_for_status()
             
             job_id = response.headers.get('X-Resource-Id')
             logger.info(f"Conversion job started: {job_id}")
@@ -263,31 +186,18 @@ class ForgeService:
             headers = {'Authorization': f'Bearer {token}'}
             url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{object_urn}/manifest"
             
-            logger.info(f"Waiting for conversion completion, max wait: {max_wait_time}s")
-            
             start_time = time.time()
             while time.time() - start_time < max_wait_time:
-                logger.info(f"Checking conversion status... ({int(time.time() - start_time)}s elapsed)")
-                
                 response = requests.get(url, headers=headers, timeout=30)
-                logger.info(f"Manifest check response: {response.status_code}")
                 
                 if response.status_code == 200:
                     manifest = response.json()
-                    status = manifest.get('status')
-                    logger.info(f"Conversion status: {status}")
-                    
-                    if status == 'success':
+                    if manifest.get('status') == 'success':
                         logger.info("Conversion completed successfully")
                         return self._download_converted_file(object_urn, token)
-                    elif status == 'failed':
+                    elif manifest.get('status') == 'failed':
                         logger.error("Conversion failed")
-                        logger.error(f"Manifest: {json.dumps(manifest, indent=2)}")
                         return None
-                    elif status == 'inprogress':
-                        logger.info("Conversion in progress, waiting...")
-                    else:
-                        logger.warning(f"Unknown status: {status}")
                 
                 time.sleep(10)  # Ждем 10 секунд перед следующей проверкой
             
@@ -304,34 +214,18 @@ class ForgeService:
             headers = {'Authorization': f'Bearer {token}'}
             url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{object_urn}/manifest"
             
-            logger.info(f"Downloading converted file from: {url}")
-            
             response = requests.get(url, headers=headers, timeout=30)
-            logger.info(f"Manifest download response: {response.status_code}")
-            
-            if response.status_code != 200:
-                logger.error(f"Failed to get manifest: {response.status_code} - {response.text}")
-                return None
+            response.raise_for_status()
             
             manifest = response.json()
-            logger.info(f"Manifest: {json.dumps(manifest, indent=2)}")
-            
             derivatives = manifest.get('derivatives', [])
-            logger.info(f"Found {len(derivatives)} derivatives")
             
             for derivative in derivatives:
-                output_type = derivative.get('outputType')
-                logger.info(f"Checking derivative with outputType: {output_type}")
-                
-                if output_type == 'dwg':
-                    children = derivative.get('children', [])
-                    logger.info(f"Found {len(children)} children in DWG derivative")
-                    
-                    for child in children:
-                        child_urn = child.get('urn')
-                        if child_urn:
-                            logger.info(f"Downloading child: {child_urn}")
-                            return self._download_and_save_to_gcs(child_urn, token)
+                if derivative.get('outputType') == 'dwg':
+                    # Получаем URL для скачивания
+                    download_url = derivative.get('children', [{}])[0].get('urn')
+                    if download_url:
+                        return self._download_and_save_to_gcs(download_url, token)
             
             logger.error("No DWG file found in conversion result")
             return None
@@ -343,42 +237,26 @@ class ForgeService:
     def _download_and_save_to_gcs(self, download_urn: str, token: str) -> Optional[str]:
         """Скачивает файл и сохраняет в GCS"""
         try:
-            logger.info(f"Downloading and saving to GCS: {download_urn}")
-            
             # Получаем URL для скачивания
             headers = {'Authorization': f'Bearer {token}'}
             url = f"https://developer.api.autodesk.com/modelderivative/v2/designdata/{download_urn}/manifest"
             
             response = requests.get(url, headers=headers, timeout=30)
-            logger.info(f"Download manifest response: {response.status_code}")
-            
-            if response.status_code != 200:
-                logger.error(f"Failed to get download manifest: {response.status_code} - {response.text}")
-                return None
-            
-            manifest = response.json()
-            logger.info(f"Download manifest: {json.dumps(manifest, indent=2)}")
+            response.raise_for_status()
             
             # Скачиваем файл
-            download_url = manifest.get('urn')
+            download_url = response.json().get('urn')
             if not download_url:
-                logger.error("No download URL found in manifest")
+                logger.error("No download URL found")
                 return None
             
-            logger.info(f"Downloading file from: {download_url}")
             file_response = requests.get(download_url, timeout=60)
-            logger.info(f"File download response: {file_response.status_code}")
-            
-            if file_response.status_code != 200:
-                logger.error(f"Failed to download file: {file_response.status_code} - {file_response.text}")
-                return None
+            file_response.raise_for_status()
             
             # Сохраняем в GCS
             current_date = datetime.now().strftime('%Y-%m-%d')
             file_name = f"converted_{int(time.time())}.dwg"
             gcs_path = f"processed/{current_date}/{file_name}"
-            
-            logger.info(f"Saving to GCS: gs://{self.bucket_name}/{gcs_path}")
             
             bucket = self.gcs_client.bucket(self.bucket_name)
             blob = bucket.blob(gcs_path)
@@ -403,25 +281,18 @@ def upload_ifc_to_forge_and_get_dwg(file_path: str) -> Optional[str]:
         URL файла в GCS или None в случае ошибки
     """
     try:
-        logger.info(f"Starting IFC to DWG conversion for file: {file_path}")
-        
         forge_service = ForgeService()
         
         # Генерируем уникальное имя для объекта
         object_name = f"ifc_{int(time.time())}.ifc"
-        logger.info(f"Generated object name: {object_name}")
         
         # Загружаем файл в Forge
-        logger.info("Step 1: Uploading file to Forge...")
         object_urn = forge_service.upload_file_to_forge(file_path, object_name)
         if not object_urn:
             logger.error("Failed to upload file to Forge")
             return None
         
-        logger.info(f"File uploaded successfully: {object_urn}")
-        
         # Конвертируем IFC в DWG
-        logger.info("Step 2: Converting IFC to DWG...")
         gcs_url = forge_service.convert_ifc_to_dwg(object_urn)
         if not gcs_url:
             logger.error("Failed to convert IFC to DWG")
