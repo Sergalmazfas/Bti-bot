@@ -235,7 +235,7 @@ def generate_fallback_data(cadastral_number: str) -> dict:
 
 # Helper: add after recommendation
 async def send_commercial_proposal(update: Update, address: str, area: float, room_type: str, materials: str, build_year, region_code: str, bti_total: float, market_total: float, recommended_total: float, bti_tariffs: dict):
-    await update.message.reply_text("�� Формирую коммерческое предложение…")
+    await update.message.reply_text("🧾 Формирую коммерческое предложение…")
     text = generate_commercial_proposal(address, area, room_type, materials, build_year, region_code, bti_total, market_total, recommended_total, bti_tariffs)
     await update.message.reply_text(text)
 
@@ -486,161 +486,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Scene 4: Commercial Proposal
     await send_commercial_proposal(update, address, area, room_type, materials, build_year, region_code, bti['total'], comp['final_price_per_m2'] * area, rec['price'], bti['tariffs'])
 
-    # Scene 5: Additional Services with Forge 3D → 2D Button
-    await send_additional_services_offer(update, address, area, room_type)
-
-async def send_additional_services_offer(update: Update, address: str, area: float, room_type: str):
-    """Отправляет предложение дополнительных услуг с кнопкой для тестирования 3D → 2D"""
-    
-    message = (
-        "🎨 **Дополнительные услуги**\n\n"
-        f"📍 **Объект:** {address}\n"
-        f"📐 **Площадь:** {area} м²\n"
-        f"🏢 **Тип:** {room_type}\n\n"
-        "**Мы также можем предложить:**\n\n"
-        "📐 **Технические чертежи** - создание рабочих чертежей по обмерам\n"
-        "📋 **Исполнительные чертежи** - чертежи фактического состояния\n"
-        "🏗️ **BIM-модель** - 3D модель объекта с детализацией\n"
-        "✏️ **Исправления** - внесение изменений в документацию\n\n"
-        "🔄 **Конвертация 3D → 2D** - автоматическая конвертация IFC файлов в DWG/PDF\n\n"
-        "💡 **Выберите интересующую услугу:**"
-    )
-    
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📐 Технические чертежи", callback_data="service_technical")],
-        [InlineKeyboardButton("📋 Исполнительные чертежи", callback_data="service_asbuilt")],
-        [InlineKeyboardButton("🏗️ BIM-модель", callback_data="service_bim")],
-        [InlineKeyboardButton("✏️ Исправления", callback_data="service_corrections")],
-        [InlineKeyboardButton("🔄 Тест 3D→2D конвертации", callback_data="test_forge_conversion")],
-        [InlineKeyboardButton("📋 Все услуги", callback_data="service_all")]
-    ])
-    
-    await update.message.reply_text(message, reply_markup=keyboard, parse_mode='Markdown')
-
-async def handle_service_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает выбор дополнительных услуг"""
-    query = update.callback_query
-    await query.answer()
-    
-    callback_data = query.data
-    
-    if callback_data == "test_forge_conversion":
-        await handle_forge_test_callback(query, context)
-    elif callback_data.startswith("service_"):
-        service_type = callback_data.replace("service_", "")
-        await handle_drawing_service_callback(query, context, service_type)
-    else:
-        await query.edit_message_text("❌ Неизвестная команда")
-
-async def handle_forge_test_callback(query, context):
-    """Обрабатывает тест Forge 3D → 2D конвертации"""
-    
-    message = (
-        "🔄 **Тест конвертации 3D → 2D**\n\n"
-        "**Функциональность:**\n"
-        "• Загрузка IFC файлов (до 100MB)\n"
-        "• Конвертация через Autodesk Forge API\n"
-        "• Результат: DWG/PDF файлы\n"
-        "• Сохранение в Google Cloud Storage\n\n"
-        "**Для тестирования:**\n"
-        "1. Отправьте IFC файл боту\n"
-        "2. Или используйте API: POST /upload\n"
-        "3. Получите ссылку на результат в GCS\n\n"
-        "**API Endpoint:**\n"
-        "```\n"
-        "POST https://btibot-637190449180.europe-west1.run.app/upload\n"
-        "Content-Type: multipart/form-data\n"
-        "file: your_file.ifc\n"
-        "```\n\n"
-        "**Поддерживаемые форматы:**\n"
-        "• Вход: IFC (Industry Foundation Classes)\n"
-        "• Выход: DWG, PDF\n\n"
-        "**Ограничения:**\n"
-        "• Максимальный размер: 100MB\n"
-        "• Время обработки: до 15 минут\n"
-        "• Результат сохраняется в GCS на 30 дней"
-    )
-    
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔙 Назад к услугам", callback_data="service_all")],
-        [InlineKeyboardButton("📞 Заказать услугу", callback_data="order_forge")]
-    ])
-    
-    await query.edit_message_text(message, reply_markup=keyboard, parse_mode='Markdown')
-
-async def handle_drawing_service_callback(query, context, service_type):
-    """Обрабатывает выбор услуг по чертежам"""
-    
-    services = {
-        "technical": {
-            "name": "Технические чертежи",
-            "description": "Создание рабочих чертежей по обмерам",
-            "price_per_m2": 150,
-            "min_price": 15000,
-            "delivery_days": 5
-        },
-        "asbuilt": {
-            "name": "Исполнительные чертежи", 
-            "description": "Чертежи фактического состояния объекта",
-            "price_per_m2": 200,
-            "min_price": 20000,
-            "delivery_days": 7
-        },
-        "bim": {
-            "name": "BIM-модель",
-            "description": "3D модель объекта с детализацией", 
-            "price_per_m2": 300,
-            "min_price": 30000,
-            "delivery_days": 10
-        },
-        "corrections": {
-            "name": "Исправления в документации",
-            "description": "Внесение изменений в существующие документы",
-            "price_per_m2": 100,
-            "min_price": 10000,
-            "delivery_days": 3
-        }
-    }
-    
-    if service_type == "all":
-        message = "📋 **Все услуги по чертежам:**\n\n"
-        for service_id, service in services.items():
-            message += f"**{service['name']}**\n"
-            message += f"📝 {service['description']}\n"
-            message += f"💰 {service['price_per_m2']} ₽/м², ⏱️ {service['delivery_days']} дней\n\n"
-        
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔙 Назад", callback_data="service_all")]
-        ])
-    else:
-        if service_type not in services:
-            await query.edit_message_text("❌ Услуга не найдена")
-            return
-            
-        service = services[service_type]
-        area = 100  # По умолчанию, можно получить из контекста
-        
-        calculated_price = area * service["price_per_m2"]
-        final_price = max(calculated_price, service["min_price"])
-        
-        message = (
-            f"📐 **{service['name']}**\n\n"
-            f"📝 **Описание:** {service['description']}\n"
-            f"📐 **Площадь:** {area} м²\n"
-            f"💰 **Цена за м²:** {service['price_per_m2']} ₽\n"
-            f"🧮 **Расчет:** {area} × {service['price_per_m2']} = {calculated_price:,.0f} ₽\n"
-            f"💵 **Итого:** {final_price:,.0f} ₽\n"
-            f"⏱️ **Срок:** {service['delivery_days']} дней\n\n"
-            f"📞 **Для заказа:** sales@zamerpro.ru, +7 (495) 000-00-00"
-        )
-        
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔙 Назад к услугам", callback_data="service_all")],
-            [InlineKeyboardButton("📞 Заказать", callback_data=f"order_{service_type}")]
-        ])
-    
-    await query.edit_message_text(message, reply_markup=keyboard, parse_mode='Markdown')
-
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.exception("Unhandled exception", exc_info=context.error)
 
@@ -654,7 +499,6 @@ def init_bot():
     application = Application.builder().token(token).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
-    application.add_handler(CallbackQueryHandler(handle_service_callback))
     application.add_error_handler(error_handler)
     if not getattr(application, "_initialized", False):
         _run_coro(application.initialize())
