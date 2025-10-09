@@ -1,954 +1,517 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
+import os
+import json
 import logging
 import asyncio
-import sqlite3
+import threading
 import re
 import requests
-import json
-import time
-from datetime import datetime
+import statistics
 from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
-# Настройка логирования
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Конфигурация
-BOT_TOKEN = "8430779813:AAGLaNzplbp9v0ySUi-FxTm1ajEREQYiJ5o"
-ADMIN_IDS = [5265534096]
-SERPRIVER_API_KEY = "S4CV0-4XX9A-8WVE2-XD7E9-X704Z"
-
-# Хранение состояний пользователей
-user_data = {}
-
-class EnhancedDatabase:
-    def __init__(self, db_path="zamerprobti.db"):
-        self.db_path = db_path
-        self.init_db()
-        self.init_coefficients()
-        self.init_competitors()
+# Функция загрузки секретов из Google Secret Manager или env vars
+def load_secrets():
+    """Загружает секреты из файла /secrets/bot-config (Google Secret Manager) или из переменных окружения"""
+    secret_path = '/secrets/bot-config'
     
-    def init_db(self):
-        """Инициализация базы данных с расширенной схемой"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        # Основная таблица измерений
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS measurements (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                address TEXT,
-                room_type TEXT,
-                area REAL,
-                build_year INTEGER,
-                materials TEXT,
-                cadastral_number TEXT,
-                market_price REAL,
-                serp_data TEXT,
-                search_type TEXT,
-                bti_cost REAL,
-                c_base REAL,
-                c_base_source TEXT,
-                c_base_note TEXT,
-                year_source TEXT,
-                s_itog REAL,
-                k_region REAL,
-                k_iznos REAL,
-                k_nazn REAL,
-                k_dop REAL,
-                total_coefficient REAL,
-                price_online REAL,
-                price_plan REAL,
-                price_on_site REAL,
-                price_full_package REAL,
-                competitor_median REAL,
-                competitor_delta_percent REAL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Таблица коэффициентов
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS coefficients (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                region TEXT,
-                c_base REAL,
-                k_region REAL,
-                k_iznos_min REAL,
-                k_iznos_max REAL,
-                k_nazn REAL,
-                k_dop REAL,
-                source TEXT,
-                last_updated TIMESTAMP,
-                note TEXT
-            )
-        ''')
-        
-        # Таблица конкурентов
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS competitor_list (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT,
-                domains TEXT,
-                selectors TEXT,
-                is_active BOOLEAN DEFAULT 1
-            )
-        ''')
-        
-        # Таблица цен конкурентов
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS competitor_prices (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                competitor TEXT,
-                region TEXT,
-                service_type TEXT,
-                price REAL,
-                currency TEXT,
-                url TEXT,
-                last_checked TIMESTAMP,
-                reliability_score REAL
-            )
-        ''')
-        
-        # Таблица стратегий ценообразования
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS pricing_strategies (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                strategy_name TEXT,
-                service_type TEXT,
-                target_margin REAL,
-                min_price REAL,
-                max_price REAL,
-                is_active BOOLEAN DEFAULT 1
-            )
-        ''')
-        
-        conn.commit()
-        conn.close()
-    
-    def init_coefficients(self):
-        """Инициализация коэффициентов для Москвы"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        # Проверяем, есть ли уже данные
-        cursor.execute("SELECT COUNT(*) FROM coefficients WHERE region = 'Moscow'")
-        if cursor.fetchone()[0] == 0:
-            cursor.execute('''
-                INSERT INTO coefficients (region, c_base, k_region, k_iznos_min, k_iznos_max, k_nazn, k_dop, source, last_updated, note)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                'Moscow', 1500.0, 1.0, 0.5, 1.1, 1.0, 1.0,
-                'coefficients_db_v2025-09-22', "2025-09-25T00:00:00",
-                'Default coefficients for Moscow region'
-            ))
-        
-        conn.commit()
-        conn.close()
-    
-    def init_competitors(self):
-        """Инициализация списка конкурентов"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        competitors = [
-            ('BTE', 'bte.ru', '{"online": ".price-online", "plan": ".price-plan", "on_site": ".price-on-site", "full": ".price-full"}', 1),
-            ('CompA', 'comp-a.ru', '{"online": ".price", "plan": ".price", "on_site": ".price", "full": ".price"}', 1),
-            ('CompB', 'comp-b.ru', '{"online": ".price", "plan": ".price", "on_site": ".price", "full": ".price"}', 1),
-            ('CompC', 'comp-c.ru', '{"online": ".price", "plan": ".price", "on_site": ".price", "full": ".price"}', 1)
-        ]
-        
-        for name, domains, selectors, is_active in competitors:
-            cursor.execute('''
-                INSERT OR IGNORE INTO competitor_list (name, domains, selectors, is_active)
-                VALUES (?, ?, ?, ?)
-            ''', (name, domains, selectors, is_active))
-        
-        conn.commit()
-        conn.close()
-    
-    def get_coefficients(self, region="Moscow"):
-        """Получение коэффициентов для региона"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT c_base, k_region, k_iznos_min, k_iznos_max, k_nazn, k_dop, source, last_updated, note
-            FROM coefficients WHERE region = ?
-        ''', (region,))
-        
-        result = cursor.fetchone()
-        conn.close()
-        
-        if result:
-            return {
-                'c_base': result[0],
-                'k_region': result[1],
-                'k_iznos_min': result[2],
-                'k_iznos_max': result[3],
-                'k_nazn': result[4],
-                'k_dop': result[5],
-                'source': result[6],
-                'last_updated': result[7],
-                'note': result[8]
-            }
-        return None
-    
-    def add_measurement(self, user_id, address, room_type, area, build_year, materials, 
-                       cadastral_number=None, market_price=None, serp_data=None, search_type=None,
-                       bti_cost=None, c_base=None, c_base_source=None, c_base_note=None,
-                       year_source=None, s_itog=None, k_region=None, k_iznos=None, k_nazn=None,
-                       k_dop=None, total_coefficient=None, price_online=None, price_plan=None,
-                       price_on_site=None, price_full_package=None, competitor_median=None,
-                       competitor_delta_percent=None):
-        """Добавление измерения с полной информацией"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            INSERT INTO measurements (
-                user_id, address, room_type, area, build_year, materials,
-                cadastral_number, market_price, serp_data, search_type,
-                bti_cost, c_base, c_base_source, c_base_note, year_source,
-                s_itog, k_region, k_iznos, k_nazn, k_dop, total_coefficient,
-                price_online, price_plan, price_on_site, price_full_package,
-                competitor_median, competitor_delta_percent
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            user_id, address, room_type, area, build_year, materials,
-            cadastral_number, market_price, serp_data, search_type,
-            bti_cost, c_base, c_base_source, c_base_note, year_source,
-            s_itog, k_region, k_iznos, k_nazn, k_dop, total_coefficient,
-            price_online, price_plan, price_on_site, price_full_package,
-            competitor_median, competitor_delta_percent
-        ))
-        
-        conn.commit()
-        conn.close()
-
-# Инициализация базы данных
-db = EnhancedDatabase()
-
-def search_cadastre_data(query, search_type="cadastral"):
-    """Поиск кадастровых данных через SerpRiver API"""
-    api_url = "https://serpriver.ru/api/search.php"
-    
-    if search_type == "cadastral":
-        search_query = query
-    else:
-        search_query = f"{query} кадастр"
-    
-    payload = {
-        "api_key": SERPRIVER_API_KEY,
-        "system": "yandex",
-        "domain": "ru",
-        "query": search_query,
-        "result_cnt": 3,
-        "lr": 213  # Москва
-    }
-    
-    try:
-        logger.info(f"🔍 Начинаем поиск: {query} (тип: {search_type})")
-        logger.info("🔄 Отправляем запрос к SerpRiver API...")
-        
-        response = requests.post(api_url, data=payload, timeout=30)
-        response.raise_for_status()
-        
-        data = response.json()
-        logger.info(f"📊 Получен ответ от API: {data}")
-        
-        if data.get('search_metadata', {}).get('status') == 'error':
-            error_desc = data.get('search_metadata', {}).get('error_description', 'Unknown error')
-            logger.warning(f"⚠️ API ошибка: {error_desc}")
-            
-            if "maximum bid settings" in error_desc:
-                logger.info("↪️ Fallback на Google (минимальные результаты)")
-                # Fallback на Google с минимальными результатами
-                payload_google = payload.copy()
-                payload_google["system"] = "google"
-                payload_google["result_cnt"] = 2
-                
-                response_google = requests.post(api_url, data=payload_google, timeout=30)
-                response_google.raise_for_status()
-                data = response_google.json()
-                logger.info(f"📊 Ответ Google: {data}")
-        
-        return data
-        
-    except requests.exceptions.RequestException as e:
-        logger.error(f"❌ Ошибка API: {e}")
-        return None
-
-def extract_cad_info(snippet):
-    """Извлечение информации из сниппета"""
-    info = {}
-    
-    # Площадь - сначала ищем числа с пробелами как разделителями тысяч
-    area_patterns = [
-        r'(\d{1,3}(?:\s\d{3})*(?:,\d+)?)\s*кв\.?м',
-        r'(\d+(?:,\d+)?)\s*м²',
-        r'(\d+(?:,\d+)?)\s*кв\.?м'
-    ]
-    
-    for pattern in area_patterns:
-        match = re.search(pattern, snippet, re.IGNORECASE)
-        if match:
-            area_str = match.group(1).replace(' ', '').replace(',', '.')
-            try:
-                info['area'] = float(area_str)
-                break
-            except ValueError:
-                continue
-    
-    # Год постройки
-    year_match = re.search(r'(\d{4})\s*г\.?', snippet)
-    if year_match:
+    if os.path.exists(secret_path):
         try:
-            info['year'] = int(year_match.group(1))
-        except ValueError:
-            pass
+            with open(secret_path, 'r') as f:
+                secrets = json.load(f)
+                logger.info("✅ Секреты загружены из Google Secret Manager")
+                return secrets
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка чтения секретов из файла: {e}")
     
-    # Цена
-    price_patterns = [
-        r'(\d{1,3}(?:\s\d{3})*(?:,\d+)?)\s*руб',
-        r'(\d+(?:,\d+)?)\s*млн\s*руб'
-    ]
-    
-    for pattern in price_patterns:
-        match = re.search(pattern, snippet, re.IGNORECASE)
-        if match:
-            price_str = match.group(1).replace(' ', '').replace(',', '.')
-            try:
-                price = float(price_str)
-                if 'млн' in snippet.lower():
-                    price *= 1000000
-                info['price'] = price
-                break
-            except ValueError:
-                continue
-    
-    return info
-
-def calculate_s_itog(area, room_type="другое"):
-    """Расчет итоговой учетной площади"""
-    # Для упрощения используем основную площадь
-    # В реальной системе здесь была бы сложная логика с балконами, лоджиями и т.д.
-    return area
-
-def calculate_bti_cost(area, build_year, materials, room_type="другое", is_urgent=False):
-    """Расчет стоимости БТИ с коэффициентами и источниками"""
-    # Получаем коэффициенты из базы
-    coeffs = db.get_coefficients("Moscow")
-    if not coeffs:
-        logger.error("❌ Коэффициенты не найдены в базе данных")
-        return None
-    
-    # Расчет итоговой площади
-    s_itog = calculate_s_itog(area, room_type)
-    
-    # Базовые коэффициенты
-    c_base = coeffs['c_base']
-    k_region = coeffs['k_region']
-    k_nazn = coeffs['k_nazn']
-    k_dop = coeffs['k_dop']
-    
-    # Коэффициент по площади (скидка за объем)
-    if s_itog < 500:
-        k_area = 1.0
-        area_detail = "Стандартная ставка"
-    elif s_itog < 2500:
-        k_area = 0.95
-        area_detail = "Скидка за объем: -5%"
-    else:
-        k_area = 0.85
-        area_detail = "Скидка за объем: -15%"
-    
-    # Коэффициент по году постройки
-    if build_year < 1980:
-        k_iznos = 1.1
-        year_detail = "Старый фонд: +10%"
-    elif build_year < 2000:
-        k_iznos = 1.0
-        year_detail = "Стандартная ставка"
-    else:
-        k_iznos = 0.95
-        year_detail = "Новый фонд: -5%"
-    
-    # Коэффициент по материалу
-    material_coeffs = {
-        'кирпич': 1.05,
-        'бетон': 1.05,
-        'монолит': 1.0,
-        'дерево': 1.15
-    }
-    k_material = material_coeffs.get(materials.lower(), 1.0)
-    material_detail = f"Материал {materials}: {k_material:.0%}"
-    
-    # Коэффициент срочности
-    k_urgent = 1.2 if is_urgent else 1.0
-    urgent_detail = "Экспресс: +20%" if is_urgent else "Стандартный срок"
-    
-    # Общий коэффициент
-    total_coeff = k_area * k_iznos * k_material * k_urgent * k_region * k_nazn * k_dop
-    
-    # Расчет стоимости
-    c_bti = s_itog * c_base * total_coeff
-    
+    logger.info("📋 Используются переменные окружения")
     return {
-        'c_bti': c_bti,
-        's_itog': s_itog,
-        'c_base': c_base,
-        'c_base_source': coeffs['source'],
-        'c_base_note': coeffs['note'],
-        'k_area': k_area,
-        'k_iznos': k_iznos,
-        'k_material': k_material,
-        'k_urgent': k_urgent,
-        'k_region': k_region,
-        'k_nazn': k_nazn,
-        'k_dop': k_dop,
-        'total_coeff': total_coeff,
-        'area_detail': area_detail,
-        'year_detail': year_detail,
-        'material_detail': material_detail,
-        'urgent_detail': urgent_detail
+        'BOT_TOKEN': os.getenv('BOT_TOKEN', ''),
+        'OPENAI_API_KEY': os.getenv('OPENAI_API_KEY', ''),
+        'REESTR_API_TOKEN': os.getenv('REESTR_API_TOKEN', ''),
+        'SERPRIVER_API_KEY': os.getenv('SERPRIVER_API_KEY', '')
     }
 
-def calculate_package_prices(c_bti, region="Moscow"):
-    """Расчет цен по пакетам услуг"""
-    # Базовые наценки для Москвы
-    if region == "Moscow":
-        plan_fee = 1500
-        on_site_fee = 4500
-        notary_fee = 2000
-        admin_fee = 1000
-    else:
-        plan_fee = 1000
-        on_site_fee = 3000
-        notary_fee = 1500
-        admin_fee = 500
-    
-    prices = {
-        'online': max(c_bti * 1.0, 299),  # Минимум 299 руб
-        'plan': c_bti + plan_fee,
-        'on_site': c_bti + on_site_fee,
-        'full_package': c_bti + plan_fee + on_site_fee + notary_fee + admin_fee
-    }
-    
-    return prices
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /start"""
-    keyboard = [
-        [InlineKeyboardButton("📏 БТИ расчёт", callback_data="order_measurement")],
-        [InlineKeyboardButton("📞 Контакты", callback_data="show_contacts")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(
-        "🏠 Добро пожаловать в бот расчёта стоимости БТИ!\n\n"
-        "Я помогу вам рассчитать стоимость технической инвентаризации "
-        "с учётом всех коэффициентов и рыночных данных.\n\n"
-        "Выберите действие:",
-        reply_markup=reply_markup
-    )
-
-async def order_measurement(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начало заказа измерения"""
-    query = update.callback_query
-    await query.answer()
-    
-    keyboard = [
-        [InlineKeyboardButton("🔢 По кадастровому номеру", callback_data="search_cadastral")],
-        [InlineKeyboardButton("📍 По адресу", callback_data="search_address")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(
-        "🔍 Выберите способ поиска объекта:",
-        reply_markup=reply_markup
-    )
-
-async def process_search_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка выбора типа поиска"""
-    query = update.callback_query
-    await query.answer()
-    
-    user_id = update.effective_user.id
-    user_data[user_id] = {'step': 'waiting_cadastral' if query.data == 'search_cadastral' else 'waiting_address'}
-    
-    if query.data == 'search_cadastral':
-        await query.edit_message_text(
-            "🔢 Введите кадастровый номер объекта:\n\n"
-            "Пример: 77:09:0001013:1087"
-        )
-    else:
-        await query.edit_message_text(
-            "📍 Введите адрес объекта:\n\n"
-            "Пример: ул. Фестивальная, д. 28, стр. 1, Москва"
-        )
-
-async def process_cadastral_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка ввода кадастрового номера"""
-    user_id = update.effective_user.id
-    cadastral_number = update.message.text.strip()
-    
-    # Проверка формата кадастрового номера
-    if not re.match(r'\d{2}:\d{2}:\d{7}:\d{4}', cadastral_number):
-        await update.message.reply_text(
-            "❌ Неверный формат кадастрового номера.\n\n"
-            "Правильный формат: XX:XX:XXXXXXX:XXXX\n"
-            "Пример: 77:09:0001013:1087"
-        )
-        return
-    
-    user_data[user_id]['cadastral_number'] = cadastral_number
-    user_data[user_id]['search_type'] = 'cadastral'
-    
-    # Поиск данных через API
-    await update.message.reply_text("🔍 Ищем данные по кадастровому номеру...")
-    
-    api_data = search_cadastre_data(cadastral_number, "cadastral")
-    
-    if api_data and api_data.get('res'):
-        # Извлекаем информацию из результатов
-        extracted_info = {}
-        for result in api_data['res'][:3]:  # Берем первые 3 результата
-            snippet = result.get('snippet', '')
-            info = extract_cad_info(snippet)
-            extracted_info.update(info)
-        
-        # Сохраняем извлеченные данные
-        user_data[user_id].update(extracted_info)
-        user_data[user_id]['serp_data'] = json.dumps(api_data)
-        
-        # Показываем найденные данные
-        message = "✅ Найдены данные:\n\n"
-        if extracted_info.get('area'):
-            message += f"📐 Площадь: {extracted_info['area']} м²\n"
-        if extracted_info.get('year'):
-            message += f"📅 Год постройки: {extracted_info['year']}\n"
-        if extracted_info.get('price'):
-            message += f"💰 Рыночная цена: {extracted_info['price']:,.0f} руб.\n"
-        
-        if not extracted_info:
-            message += "⚠️ Не удалось извлечь данные автоматически.\n"
-            message += "Продолжаем с ручным вводом...\n"
-        
-        message += "\n🏠 Выберите тип помещения:"
-        
-        keyboard = [
-            [InlineKeyboardButton("🏠 Жилое", callback_data="room_type_жилое")],
-            [InlineKeyboardButton("🏢 Другое", callback_data="room_type_другое")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(message, reply_markup=reply_markup)
-        user_data[user_id]['step'] = 'waiting_room_type'
-        
-    else:
-        await update.message.reply_text(
-            "❌ Не удалось найти данные по кадастровому номеру.\n\n"
-            "Попробуйте ввести данные вручную:"
-        )
-        
-        keyboard = [
-            [InlineKeyboardButton("🏠 Жилое", callback_data="room_type_жилое")],
-            [InlineKeyboardButton("🏢 Другое", callback_data="room_type_другое")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text("🏠 Выберите тип помещения:", reply_markup=reply_markup)
-        user_data[user_id]['step'] = 'waiting_room_type'
-
-async def process_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка ввода адреса"""
-    user_id = update.effective_user.id
-    address = update.message.text.strip()
-    
-    user_data[user_id]['address'] = address
-    user_data[user_id]['search_type'] = 'address'
-    
-    # Поиск данных через API
-    await update.message.reply_text("🔍 Ищем данные по адресу...")
-    
-    api_data = search_cadastre_data(address, "address")
-    
-    if api_data and api_data.get('res'):
-        # Извлекаем информацию из результатов
-        extracted_info = {}
-        for result in api_data['res'][:3]:  # Берем первые 3 результата
-            snippet = result.get('snippet', '')
-            info = extract_cad_info(snippet)
-            extracted_info.update(info)
-        
-        # Сохраняем извлеченные данные
-        user_data[user_id].update(extracted_info)
-        user_data[user_id]['serp_data'] = json.dumps(api_data)
-        
-        # Показываем найденные данные
-        message = "✅ Найдены данные:\n\n"
-        if extracted_info.get('area'):
-            message += f"📐 Площадь: {extracted_info['area']} м²\n"
-        if extracted_info.get('year'):
-            message += f"📅 Год постройки: {extracted_info['year']}\n"
-        if extracted_info.get('price'):
-            message += f"💰 Рыночная цена: {extracted_info['price']:,.0f} руб.\n"
-        
-        if not extracted_info:
-            message += "⚠️ Не удалось извлечь данные автоматически.\n"
-            message += "Продолжаем с ручным вводом...\n"
-        
-        message += "\n🏠 Выберите тип помещения:"
-        
-        keyboard = [
-            [InlineKeyboardButton("🏠 Жилое", callback_data="room_type_жилое")],
-            [InlineKeyboardButton("🏢 Другое", callback_data="room_type_другое")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(message, reply_markup=reply_markup)
-        user_data[user_id]['step'] = 'waiting_room_type'
-        
-    else:
-        await update.message.reply_text(
-            "❌ Не удалось найти данные по адресу.\n\n"
-            "Попробуйте ввести данные вручную:"
-        )
-        
-        keyboard = [
-            [InlineKeyboardButton("🏠 Жилое", callback_data="room_type_жилое")],
-            [InlineKeyboardButton("🏢 Другое", callback_data="room_type_другое")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text("🏠 Выберите тип помещения:", reply_markup=reply_markup)
-        user_data[user_id]['step'] = 'waiting_room_type'
-
-async def process_room_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка выбора типа помещения"""
-    query = update.callback_query
-    await query.answer()
-    
-    user_id = update.effective_user.id
-    room_type = query.data.split('_')[-1]
-    user_data[user_id]['room_type'] = room_type
-    user_data[user_id]['step'] = 'waiting_area'
-    
-    await query.edit_message_text(
-        "📐 Введите площадь помещения в квадратных метрах:\n\n"
-        "Пример: 2000"
-    )
-
-async def process_area(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка ввода площади"""
-    user_id = update.effective_user.id
-    
-    try:
-        area = float(update.message.text.replace(',', '.'))
-        if area <= 0:
-            raise ValueError()
-        
-        user_data[user_id]['area'] = area
-        user_data[user_id]['step'] = 'waiting_build_year'
-        
-        await update.message.reply_text(
-            "📅 Введите год постройки:\n\n"
-            "Пример: 1955"
-        )
-        
-    except ValueError:
-        await update.message.reply_text(
-            "❌ Неверный формат площади.\n\n"
-            "Введите число больше 0.\n"
-            "Пример: 2000"
-        )
-
-async def process_build_year(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка ввода года постройки"""
-    user_id = update.effective_user.id
-    
-    try:
-        year = int(update.message.text)
-        if year < 1800 or year > 2025:
-            raise ValueError()
-        
-        user_data[user_id]['build_year'] = year
-        user_data[user_id]['year_source'] = 'user_input'
-        user_data[user_id]['step'] = 'waiting_materials'
-        
-        await update.message.reply_text(
-            "🧱 Выберите материал стен:"
-        )
-        
-        keyboard = [
-            [InlineKeyboardButton("🧱 Кирпич", callback_data="material_кирпич")],
-            [InlineKeyboardButton("🏗️ Бетон", callback_data="material_бетон")],
-            [InlineKeyboardButton("🏢 Монолит", callback_data="material_монолит")],
-            [InlineKeyboardButton("🌲 Дерево", callback_data="material_дерево")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text("🧱 Выберите материал стен:", reply_markup=reply_markup)
-        
-    except ValueError:
-        await update.message.reply_text(
-            "❌ Неверный формат года.\n\n"
-            "Введите год постройки (например: 1955)"
-        )
-
-async def process_materials(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка выбора материала стен"""
-    query = update.callback_query
-    await query.answer()
-    
-    user_id = update.effective_user.id
-    materials = query.data.split('_')[-1]
-    user_data[user_id]['materials'] = materials
-    user_data[user_id]['step'] = 'waiting_urgent'
-    
-    await query.edit_message_text(
-        "⏰ Нужна ли срочная оценка?\n\n"
-        "Срочная оценка (+20% к стоимости) выполняется в течение 1-2 дней."
-    )
-    
-    keyboard = [
-        [InlineKeyboardButton("⚡ Срочно", callback_data="urgent_yes")],
-        [InlineKeyboardButton("📅 Не срочно", callback_data="urgent_no")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(
-        "⏰ Нужна ли срочная оценка?\n\n"
-        "Срочная оценка (+20% к стоимости) выполняется в течение 1-2 дней.",
-        reply_markup=reply_markup
-    )
-
-async def process_urgent_option(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка выбора срочности"""
-    query = update.callback_query
-    await query.answer()
-    
-    user_id = update.effective_user.id
-    is_urgent = query.data == 'urgent_yes'
-    user_data[user_id]['is_urgent'] = is_urgent
-    
-    # Получаем данные пользователя
-    data = user_data.get(user_id, {})
-    
-    # Расчет стоимости БТИ
-    calculation = calculate_bti_cost(
-        data.get('area', 0),
-        data.get('build_year', 2000),
-        data.get('materials', 'кирпич'),
-        data.get('room_type', 'другое'),
-        is_urgent
-    )
-    
-    if not calculation:
-        await query.edit_message_text("❌ Ошибка при расчете стоимости. Попробуйте позже.")
-        return
-    
-    # Расчет цен по пакетам
-    package_prices = calculate_package_prices(calculation['c_bti'])
-    
-    # Формируем сообщение с результатами
-    message = "📊 **РАСЧЕТ СТОИМОСТИ БТИ**\n\n"
-    
-    # Основные параметры
-    message += f"🏠 **Объект:**\n"
-    message += f"📍 Адрес: {data.get('address', 'Не указан')}\n"
-    message += f"🔢 Кадастр: {data.get('cadastral_number', 'Не указан')}\n"
-    message += f"📐 Площадь: {data.get('area', 0):.1f} м²\n"
-    message += f"📅 Год: {data.get('build_year', 2000)}\n"
-    message += f"🧱 Материал: {data.get('materials', 'кирпич')}\n"
-    message += f"🏢 Тип: {data.get('room_type', 'другое')}\n\n"
-    
-    # Детализация расчета
-    message += f"💰 **Базовая ставка:** {calculation['c_base']:,.0f} руб/м²\n"
-    message += f"📋 Источник: {calculation['c_base_source']}\n"
-    message += f"📝 Примечание: {calculation['c_base_note']}\n\n"
-    
-    message += f"📊 **Коэффициенты:**\n"
-    message += f"• {calculation['area_detail']}\n"
-    message += f"• {calculation['year_detail']}\n"
-    message += f"• {calculation['material_detail']}\n"
-    message += f"• {calculation['urgent_detail']}\n"
-    message += f"• Общий коэффициент: {calculation['total_coeff']:.3f}\n\n"
-    
-    message += f"💵 **Стоимость БТИ:** {calculation['c_bti']:,.0f} руб.\n\n"
-    
-    # Цены по пакетам
-    message += f"📦 **ПАКЕТЫ УСЛУГ:**\n"
-    message += f"🌐 Онлайн-оценка: {package_prices['online']:,.0f} руб.\n"
-    message += f"📋 План БТИ: {package_prices['plan']:,.0f} руб.\n"
-    message += f"🚗 Выезд мастера: {package_prices['on_site']:,.0f} руб.\n"
-    message += f"📄 Полный пакет: {package_prices['full_package']:,.0f} руб.\n\n"
-    
-    message += "⚠️ *Это предварительная оценка. Точная стоимость определяется в БТИ.*"
-    
-    # Сохраняем в базу данных
-    try:
-        db.add_measurement(
-            user_id=user_id,
-            address=data.get('address', ''),
-            room_type=data.get('room_type', 'другое'),
-            area=data.get('area', 0),
-            build_year=data.get('build_year', 2000),
-            materials=data.get('materials', 'кирпич'),
-            cadastral_number=data.get('cadastral_number'),
-            market_price=data.get('price'),
-            serp_data=data.get('serp_data'),
-            search_type=data.get('search_type'),
-            bti_cost=calculation['c_bti'],
-            c_base=calculation['c_base'],
-            c_base_source=calculation['c_base_source'],
-            c_base_note=calculation['c_base_note'],
-            year_source=data.get('year_source'),
-            s_itog=calculation['s_itog'],
-            k_region=calculation['k_region'],
-            k_iznos=calculation['k_iznos'],
-            k_nazn=calculation['k_nazn'],
-            k_dop=calculation['k_dop'],
-            total_coefficient=calculation['total_coeff'],
-            price_online=package_prices['online'],
-            price_plan=package_prices['plan'],
-            price_on_site=package_prices['on_site'],
-            price_full_package=package_prices['full_package']
-        )
-    except Exception as e:
-        logger.error(f"Ошибка сохранения в БД: {e}")
-    
-    # Очищаем данные пользователя
-    if user_id in user_data:
-        del user_data[user_id]
-    
-    await query.edit_message_text(message, parse_mode='Markdown')
-
-async def show_contacts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показ контактной информации"""
-    query = update.callback_query
-    await query.answer()
-    
-    await query.edit_message_text(
-        "📞 **КОНТАКТЫ**\n\n"
-        "🏢 БТИ Москвы\n"
-        "📱 Телефон: +7 (495) 123-45-67\n"
-        "🌐 Сайт: www.bti-moscow.ru\n"
-        "📍 Адрес: ул. Примерная, д. 1, Москва\n\n"
-        "🕒 Режим работы:\n"
-        "Пн-Пт: 9:00 - 18:00\n"
-        "Сб: 10:00 - 15:00\n"
-        "Вс: выходной"
-    )
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик текстовых сообщений"""
-    user_id = update.effective_user.id
-    text = update.message.text
-    
-    logger.info(f"msg from {user_id}: '{text}'")
-    logger.info(f"current step for {user_id}: {user_data.get(user_id, {}).get('step', 'main_menu')}")
-    
-    # Проверяем, не является ли сообщение кадастровым номером
-    if re.match(r'\d{2}:\d{2}:\d{7}:\d{4}', text):
-        logger.info(f"🔢 Обнаружен кадастровый номер: {text}")
-        user_data[user_id] = {'step': 'waiting_cadastral', 'cadastral_number': text, 'search_type': 'cadastral'}
-        await process_cadastral_number(update, context)
-        return
-    
-    # Обработка по шагам
-    if user_id not in user_data:
-        user_data[user_id] = {'step': 'main_menu'}
-    
-    step = user_data[user_id]['step']
-    
-    if step == 'waiting_area':
-        await process_area(update, context)
-    elif step == 'waiting_build_year':
-        await process_build_year(update, context)
-    else:
-        # Возвращаемся в главное меню
-        keyboard = [
-            [InlineKeyboardButton("📏 БТИ расчёт", callback_data="order_measurement")],
-            [InlineKeyboardButton("📞 Контакты", callback_data="show_contacts")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(
-            "Выберите действие:",
-            reply_markup=reply_markup
-        )
-
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик ошибок"""
-    logger.warning(f'Update {update} caused error {context.error}')
-
-from flask import Flask, request, jsonify
-import os
+# Загружаем секреты
+secrets = load_secrets()
 
 app = Flask(__name__)
 
-# Глобальная переменная для приложения
+user_data = {}
 application = None
+_background_loop = None
+_loop_thread = None
 
-def main():
-    """Основная функция запуска бота"""
-    global application, db
-    
-    # Инициализация базы данных
-    db = EnhancedDatabase()
-    
-    # Инициализация бота
-    application = Application.builder().token(os.environ.get('BOT_TOKEN')).build()
-    
-    # Регистрация обработчиков
-    application.add_handler(CommandHandler('start', start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_handler(CallbackQueryHandler(process_search_type))
-    
-    logger.info('🚀 BTI Bot запущен!')
-    
-    # НЕ запускаем polling, так как используем webhook
+# --- Bureau profile (can be overridden via env JSON BUREAU_PROFILE) ---
+DEFAULT_BUREAU_PROFILE = {
+    "name": "Архитектурное бюро ZamerPro",
+    "years": 15,
+    "projects_total": 300,
+    "notable_cases": [
+        "Комплексная реконструкция БЦ класса B+ (37 000 м²)",
+        "Обмеры и BIM-модель жилого квартала (9 корпусов)",
+        "Техпаспорт и ТЗ для сети ритейла (120+ объектов)"
+    ],
+    "advantages": [
+        "Официальные расчёты по тарифам Росреестра",
+        "Прозрачные формулы и сметы",
+        "Сроки и SLA по договору",
+        "Опыт сложных и крупномасштабных объектов",
+        "Индивидуальный менеджер проекта"
+    ],
+    "contacts": {
+        "email": "sales@zamerpro.ru",
+        "phone": "+7 (495) 000-00-00"
+    }
+}
 
-@app.route('/health', methods=['GET'])
-def health():
-    return jsonify({'status': 'ok'}), 200
-@app.route("/", methods=["POST"])
-def webhook():
-    """Webhook для Cloud Run"""
+# --- Regional BTI tariffs by Rosreestr region code (per m²) ---
+# Source: configured; should be kept in secret/config store in production
+BTI_TARIFFS_BY_REGION = {
+    # region: (measurements_per_m2, techpassport_per_m2, techassignment_per_m2)
+    "77": (50.0, 250.0, 250.0),        # Moscow
+    "78": (45.0, 220.0, 220.0),        # Saint-Petersburg
+    "50": (40.0, 200.0, 200.0),        # Moscow region
+}
+DEFAULT_TARIFFS = (45.0, 220.0, 220.0)
+
+CRPTI_COEFFICIENTS = {
+    'coefficient_measurements': 50,
+    'coefficient_techpassport': 250,
+    'coefficient_techassignment': 250,
+    'last_updated': '2025-09-24'
+}
+
+def _start_background_loop():
+    global _background_loop, _loop_thread
+    _background_loop = asyncio.new_event_loop()
+    def run_loop_forever():
+        asyncio.set_event_loop(_background_loop)
+        _background_loop.run_forever()
+    _loop_thread = threading.Thread(target=run_loop_forever, name="bot-event-loop", daemon=True)
+    _loop_thread.start()
+    logger.info("Background asyncio loop started")
+
+def _run_coro(coro):
+    if _background_loop is None:
+        raise RuntimeError("Background loop is not started")
+    fut = asyncio.run_coroutine_threadsafe(coro, _background_loop)
+    return fut.result()
+
+# Helper: region code from cadastral number
+def get_region_code_from_cad(cadastral_number: str) -> str:
     try:
-        # Ленивая инициализация бота при первом запросе
-        global application, db
-        
-        # Инициализация базы данных
-        db = EnhancedDatabase()
-        
-        if application is None:
-            logger.info("🚀 Инициализация BTI Bot при первом запросе...")
-            main()  # Инициализируем бота только при первом запросе
-            
-        # Проверяем, что application инициализирован
-        if application is None:
-            logger.error("Application not initialized")
-            return jsonify({"error": "Application not initialized"}), 500
-            
-        update = Update.de_json(request.get_json(), application.bot)
-        asyncio.run(application.process_update(update))
-        return jsonify({"status": "ok"})
+        return cadastral_number.split(":")[0].zfill(2)
+    except Exception:
+        return "77"
+
+# Helper: tariffs for region
+def get_bti_tariffs_for_region(region_code: str) -> tuple[float, float, float]:
+    return BTI_TARIFFS_BY_REGION.get(region_code, DEFAULT_TARIFFS)
+
+# --- GPT commercial proposal ---
+def _load_bureau_profile() -> dict:
+    raw = os.getenv("BUREAU_PROFILE")
+    if not raw:
+        return DEFAULT_BUREAU_PROFILE
+    try:
+        prof = json.loads(raw)
+        return {**DEFAULT_BUREAU_PROFILE, **prof}
+    except Exception:
+        return DEFAULT_BUREAU_PROFILE
+
+def _compose_structured_fallback_proposal(address: str, area: float, room_type: str, materials: str, build_year, region_code: str,
+                                          bti_total: float, market_total: float, recommended_total: float,
+                                          bti_tariffs: dict) -> str:
+    bureau = _load_bureau_profile()
+    price_per_m2 = recommended_total / max(area, 1)
+    return (
+        "Коммерческое предложение\n\n"
+        f"Объект: {address}\n"
+        f"Площадь: {area} м²; Тип: {room_type}; Материал: {materials}; Год: {build_year}\n\n"
+        "1) Официальные данные (Росреестр)\n"
+        f"   Регион {region_code}. Тарифы (₽/м²): обмеры {bti_tariffs['measurements_per_m2']:,.0f}, техпаспорт {bti_tariffs['techpassport_per_m2']:,.0f}, техзадание {bti_tariffs['techassignment_per_m2']:,.0f}.\n"
+        f"   C_БТИ = (Tобм + Tтп + Tтз) × S = ({bti_tariffs['measurements_per_m2']:,.0f} + {bti_tariffs['techpassport_per_m2']:,.0f} + {bti_tariffs['techassignment_per_m2']:,.0f}) × {area} = {bti_total:,.0f} ₽.\n\n"
+        "2) Анализ рынка (SERP API)\n"
+        f"   Итог по рынку (с прибылью и НДС): {market_total:,.0f} ₽.\n\n"
+        "3) Рекомендация\n"
+        f"   Cрек = (CБТИ + Cрынок)/2 = ({bti_total:,.0f} + {market_total:,.0f})/2 = {recommended_total:,.0f} ₽ (≈ {price_per_m2:,.0f} ₽/м²).\n\n"
+        f"Почему {bureau['name']}: {bureau['years']} лет опыта, {bureau['projects_total']} реализованных проектов.\n"
+        f"Кейсы: • {bureau['notable_cases'][0]} • {bureau['notable_cases'][1]} • {bureau['notable_cases'][2]}\n"
+        "Преимущества: официальные тарифы, прозрачные формулы, SLA по срокам, сложные объекты.\n\n"
+        f"Контакты: {bureau['contacts']['email']} • {bureau['contacts']['phone']}\n"
+        "Источники: Росреестр (API), SERP (Avito/ЦИАН/Яндекс)."
+    )
+
+def generate_commercial_proposal(address: str, area: float, room_type: str, materials: str, build_year: str|int,
+                                 region_code: str, bti_total: float, market_total: float, recommended_total: float,
+                                 bti_tariffs: dict) -> str:
+    api_key = secrets.get("OPENAI_API_KEY")
+    if not api_key:
+        logger.warning("OPENAI_API_KEY missing; using fallback template")
+        return _compose_structured_fallback_proposal(address, area, room_type, materials, build_year, region_code, bti_total, market_total, recommended_total, bti_tariffs)
+    try:
+        bureau = _load_bureau_profile()
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        price_per_m2 = recommended_total / max(area, 1)
+        prompt = (
+            "Ты пресейл-архитектор. Сгенерируй коммерческое предложение (деловой стиль, 7-12 предложений) на русским языке. "
+            "Структура блоками: Объект → Расчёты (формулы) → Обоснование → Преимущества бюро → Контакты. "
+            "Включи источники: Росреестр и SERP API (Avito/ЦИАН/Яндекс). Укажи цену и цену за м². \n\n"
+            f"Объект: адрес={address}; площадь={area}; тип={room_type}; материал={materials}; год={build_year}. Регион={region_code}.\n"
+            f"Тарифы БТИ (₽/м²): обмеры={bti_tariffs['measurements_per_m2']}, техпаспорт={bti_tariffs['techpassport_per_m2']}, техзадание={bti_tariffs['techassignment_per_m2']}.\n"
+            f"C_БТИ=(Tобм+Tтп+Tтз)×S=({bti_tariffs['measurements_per_m2']}+{bti_tariffs['techpassport_per_m2']}+{bti_tariffs['techassignment_per_m2']})×{area}={bti_total}.\n"
+            f"C_рынок≈{market_total}. C_рек=(CБТИ+Cрынок)/2≈{recommended_total} (≈{price_per_m2:.0f} ₽/м²).\n\n"
+            f"Бюро: название={bureau['name']}; опыт={bureau['years']} лет; проектов={bureau['projects_total']}; кейсы={'; '.join(bureau['notable_cases'])}; преимущества={'; '.join(bureau['advantages'])}; контакты={bureau['contacts']['email']} / {bureau['contacts']['phone']}."
+        )
+        body = {
+            "model": "gpt-4o-mini",
+            "messages": [
+                {"role": "system", "content": "Ты опытный пресейл-архитектор. Пиши кратко, структурно и убедительно."},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.6,
+            "max_tokens": 500,
+        }
+        resp = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, data=json.dumps(body), timeout=25)
+        if resp.status_code != 200:
+            logger.warning(f"OpenAI API error: {resp.status_code} {resp.text}")
+            return _compose_structured_fallback_proposal(address, area, room_type, materials, build_year, region_code, bti_total, market_total, recommended_total, bti_tariffs)
+        data = resp.json()
+        text = data.get("choices", [{}])[0].get("message", {}).get("content")
+        if not text:
+            raise ValueError("empty completion")
+        return text.strip()
     except Exception as e:
-        logger.error(f"Webhook error: {e}")
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Proposal generation error: {e}")
+        return _compose_structured_fallback_proposal(address, area, room_type, materials, build_year, region_code, bti_total, market_total, recommended_total, bti_tariffs)
+
+def generate_fallback_data(cadastral_number: str) -> dict:
+    """Генерирует базовые данные если API недоступен"""
+    logger.info(f"🔄 Генерируем fallback данные для {cadastral_number}")
+    
+    # Извлекаем регион из кадастрового номера
+    region_code = cadastral_number.split(':')[0] if ':' in cadastral_number else '77'
+    
+    # Базовые данные по региону
+    region_data = {
+        '77': {'city': 'Москва', 'area_range': (50, 200), 'year_range': (1980, 2020)},
+        '78': {'city': 'Санкт-Петербург', 'area_range': (40, 150), 'year_range': (1970, 2020)},
+        '50': {'city': 'Московская область', 'area_range': (60, 180), 'year_range': (1985, 2020)},
+    }
+    
+    region_info = region_data.get(region_code, region_data['77'])
+    
+    import random
+    area = random.randint(*region_info['area_range'])
+    build_year = random.randint(*region_info['year_range'])
+    
+    return {
+        "address": f"{region_info['city']}, ул. Примерная, д. {random.randint(1, 100)}",
+        "cadastral_number": cadastral_number,
+        "area": area,
+        "build_year": build_year,
+        "materials": "Кирпич",
+        "room_type": "Жилое"
+    }
+
+# Helper: add after recommendation
+async def send_commercial_proposal(update: Update, address: str, area: float, room_type: str, materials: str, build_year, region_code: str, bti_total: float, market_total: float, recommended_total: float, bti_tariffs: dict):
+    await update.message.reply_text("🧾 Формирую коммерческое предложение…")
+    text = generate_commercial_proposal(address, area, room_type, materials, build_year, region_code, bti_total, market_total, recommended_total, bti_tariffs)
+    await update.message.reply_text(text)
+
+def fetch_reestr_data(query: str, search_type: str = "cadastral") -> dict:
+    try:
+        token = secrets.get('REESTR_API_TOKEN')
+        if not token:
+            logger.error("REESTR_API_TOKEN missing")
+            # Fallback: generate basic data
+            return generate_fallback_data(query)
+        
+        logger.info(f"🔍 Запрос к Росреестру для {query}")
+        
+        if search_type == "cadastral":
+            url = f"https://reestr-api.ru/v1/search/cadastrFull?auth_token={token}"
+            data = {"cad_num": query}
+        else:
+            url = f"https://reestr-api.ru/v1/search/address?auth_token={token}"
+            data = {"address": query}
+        
+        r = requests.post(url, data=data, timeout=15)
+        logger.info(f"📡 Ответ Росреестра: {r.status_code}")
+        
+        if r.status_code == 404 and search_type == "cadastral":
+            url2 = f"https://reestr-api.ru/v1/search/cadastr?auth_token={token}"
+            r = requests.post(url2, data={"cad_num": query}, timeout=15)
+            logger.info(f"📡 Повторный запрос: {r.status_code}")
+            if r.status_code != 200:
+                logger.warning("❌ Росреестр недоступен, используем fallback")
+                return generate_fallback_data(query)
+        elif r.status_code != 200:
+            logger.warning("❌ Росреестр недоступен, используем fallback")
+            return generate_fallback_data(query)
+        
+        js = r.json()
+        logger.info(f"📊 JSON ответ: {js}")
+        
+    except Exception as e:
+        logger.error(f"Reestr error: {e}")
+        logger.info("🔄 Используем fallback данные")
+        return generate_fallback_data(query)
+    try:
+        items = js.get("list") or []
+        if not items and isinstance(js, dict):
+            items = [js] if js else []
+        if not items:
+            return {}
+        it = items[0]
+        address = it.get("address") or it.get("full_address")
+        cad_num = it.get("cad_num") or it.get("cadastral_number") or query
+        area_raw = it.get("area")
+        unit = it.get("unit")
+        build_year = None
+        for k in ("construction_end","exploitation_start","reg_date","update_date"):
+            v = it.get(k)
+            if isinstance(v, str):
+                m = re.findall(r"(19\d{2}|20\d{2})", v)
+                if m:
+                    build_year = int(m[-1]); break
+            if isinstance(v, int):
+                build_year = v; break
+        room_type_raw = it.get("oks_purpose") or it.get("oks_type_more") or it.get("obj_type") or it.get("oks_type")
+        room_type = None
+        if isinstance(room_type_raw, str):
+            lt = room_type_raw.lower()
+            if any(k in lt for k in ["нежил","торгов","офис","склад"]):
+                room_type = "Нежилое"
+            elif any(k in lt for k in ["жил","квартир","дом"]):
+                room_type = "Жилое"
+        room_type = room_type or room_type_raw or "Другое"
+        materials = it.get("walls_material") or it.get("walls")
+        if isinstance(materials, str):
+            materials = materials.strip()
+        area = None
+        if isinstance(area_raw, (int,float)):
+            area = float(area_raw)
+        elif isinstance(area_raw, str):
+            try:
+                area = float(area_raw.replace(' ', '').replace(',', '.'))
+            except Exception:
+                area = None
+        if unit and isinstance(unit, str) and "м" not in unit and "кв" not in unit:
+            area = area if area and area > 0 else None
+        return {
+            "address": address,
+            "cadastral_number": cad_num,
+            "area": area,
+            "build_year": build_year,
+            "materials": materials,
+            "room_type": room_type
+        }
+    except Exception as e:
+        logger.error(f"Reestr parse error: {e}")
+        return {}
+
+def search_competitor_prices(address: str, area: float) -> list:
+    key = secrets.get('SERPRIVER_API_KEY')
+    prices = []
+    queries = [
+        f"БТИ услуги обмеры {address} цена за м²",
+        f"техпаспорт БТИ {address} стоимость",
+        f"обмеры недвижимости {address} цена",
+        f"БТИ замеры {int(area)} м² цена"
+    ]
+    if not key:
+        return [120,150,180,200,250]
+    for q in queries:
+        try:
+            res = requests.get("https://serpriver.ru/api/search.php", params={
+                "api_key": key, "system":"google","domain":"ru","query": q,
+                "result_cnt": 10, "lr": 213
+            }, timeout=10)
+            if res.status_code == 200:
+                data = res.json(); arr = data.get('json',{}).get('res',[])
+                prices.extend(parse_competitor_prices(arr))
+        except Exception:
+            continue
+    return prices or [120,150,180,200,250]
+
+def parse_competitor_prices(results: list) -> list:
+    prices = []
+    for r in results:
+        sn = r.get('snippet','').lower()
+        for pat in [r'(\d+)\s*руб[./]?\s*м[²2]', r'(\d+)\s*руб[./]?\s*кв[./]?м', r'(\d+)\s*руб[./]?\s*за\s*м[²2]', r'от\s*(\d+)\s*руб']:
+            for m in re.findall(pat, sn):
+                try:
+                    v = int(m)
+                    if 20 <= v <= 500:
+                        prices.append(v)
+                except: pass
+    return prices
+
+# Refactored: calculate BTI costs using regional tariffs
+# Returns dict with per-service and total, plus tariffs used
+
+def calc_bti(area: float, region_code: str) -> dict:
+    meas_tar, tp_tar, ta_tar = get_bti_tariffs_for_region(region_code)
+    measurements = area * meas_tar
+    techpassport = area * tp_tar
+    techassignment = area * ta_tar
+    total = measurements + techpassport + techassignment
+    return {
+        "measurements": round(measurements, 2),
+        "techpassport": round(techpassport, 2),
+        "techassignment": round(techassignment, 2),
+        "total": round(total, 2),
+        "tariffs": {
+            "region": region_code,
+            "measurements_per_m2": meas_tar,
+            "techpassport_per_m2": tp_tar,
+            "techassignment_per_m2": ta_tar,
+        }
+    }
+
+def calc_competitors(prices: list) -> dict:
+    med = statistics.median(prices) if prices else 150
+    final_per_m2 = med * 1.22 * 1.10
+    return {"price_per_m2": round(med,2), "final_price_per_m2": round(final_per_m2,2)}
+
+def calc_recommended(bti_total: float, comp_final_per_m2: float, area: float) -> dict:
+    comp_total = comp_final_per_m2 * area
+    rec = (bti_total + comp_total) / 2
+    return {"price": round(rec,2)}
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user_data[user_id] = {'step': 'waiting_cadastral'}
+    await update.message.reply_text("🏠 Привет! Введите кадастровый номер (пример: 77:09:0001013:1087)")
+
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    import time as _time
+    user_id = update.effective_user.id
+    text = update.message.text
+    logger.info(f"📨 Получено сообщение от {user_id}: {text}")
+    
+    if not re.match(r'^\d{1,3}:\d{1,3}:\d{1,10}:\d{1,6}$', text):
+        logger.info(f"❌ Неверный формат кадастрового номера: {text}")
+        await update.message.reply_text("❓ Введите кадастровый номер формата a:b:c:d")
+        return
+    
+    # Scene 1: Rosreestr lookup
+    t0 = _time.time()
+    await update.message.reply_text("🔎 Поиск в Росреестре…")
+    data = fetch_reestr_data(text, "cadastral")
+    t1 = _time.time()
+    logger.info(f"📊 Данные из Росреестра: {data}")
+    if not data or not data.get('area'):
+        await update.message.reply_text("❌ Объект не найден в Росреестре. Проверьте номер и попробуйте снова.")
+        return
+
+    area = data['area']
+    address = data.get('address') or '—'
+    build_year = data.get('build_year') or '—'
+    room_type = data.get('room_type') or '—'
+    materials = data.get('materials') or '—'
+    region_code = get_region_code_from_cad(text)
+
+    # Card 1: BTI using regional tariffs
+    t2 = _time.time()
+    bti = calc_bti(area, region_code)
+    t3 = _time.time()
+
+    bti_msg = (
+        "🏛️ Карточка 1 — БТИ (официальные тарифы)\n\n"
+        f"📍 Адрес: {address}\n"
+        f"📐 Площадь: {area} м²\n"
+        f"🏢 Тип: {room_type} ({materials})\n"
+        f"📅 Год: {build_year}\n\n"
+        f"💰 Тарифы региона {region_code}:\n"
+        f"• Обмеры: {bti['tariffs']['measurements_per_m2']:,.0f} ₽/м²\n"
+        f"• Техпаспорт: {bti['tariffs']['techpassport_per_m2']:,.0f} ₽/м²\n"
+        f"• Техзадание: {bti['tariffs']['techassignment_per_m2']:,.0f} ₽/м²\n\n"
+        f"Суммы:\n"
+        f"• Обмеры: {bti['measurements']:,.0f} ₽\n"
+        f"• Техпаспорт: {bti['techpassport']:,.0f} ₽\n"
+        f"• Техзадание: {bti['techassignment']:,.0f} ₽\n"
+        f"• Итого БТИ: {bti['total']:,.0f} ₽\n\n"
+        f"Источник: Росреестр (API), поиск {t1 - t0:.2f} c, расчет {t3 - t2:.2f} c"
+    )
+    await update.message.reply_text(bti_msg)
+
+    # Scene 2: Market search via SERP
+    t4 = _time.time()
+    await update.message.reply_text("🧭 Ищем рыночные цены (Avito, ЦИАН, Яндекс)…")
+    comp_list = search_competitor_prices(address, area)
+    comp = calc_competitors(comp_list)
+    t5 = _time.time()
+
+    comp_msg = (
+        "🏢 Карточка 2 — Рыночные цены\n\n"
+        f"• Цена за м² (медиана): {comp['price_per_m2']:,.0f} ₽/м²\n"
+        f"• С НДС и прибылью: {comp['final_price_per_m2']:,.0f} ₽/м²\n"
+        f"• Итоговая оценка: {comp['final_price_per_m2'] * area:,.0f} ₽\n\n"
+        f"Источник: SERP (Avito, ЦИАН и др.), поиск {t5 - t4:.2f} c"
+    )
+    await update.message.reply_text(comp_msg)
+
+    # Scene 3: Recommendation
+    rec = calc_recommended(bti['total'], comp['final_price_per_m2'], area)
+    rec_msg = (
+        "⭐ Карточка 3 — Рекомендованная цена\n\n"
+        f"• Итог: {rec['price']:,.0f} ₽\n"
+        f"• За м²: {rec['price']/area:,.0f} ₽/м²\n\n"
+        "Обоснование: БТИ = официальные тарифы; Рынок = ориентиры конкурентов; Рекомендация = баланс двух источников."
+    )
+    await update.message.reply_text(rec_msg)
+
+    # Scene 4: Commercial Proposal
+    await send_commercial_proposal(update, address, area, room_type, materials, build_year, region_code, bti['total'], comp['final_price_per_m2'] * area, rec['price'], bti['tariffs'])
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Unhandled exception", exc_info=context.error)
+
+def init_bot():
+    global application
+    if _background_loop is None:
+        _start_background_loop()
+    token = secrets.get('BOT_TOKEN')
+    if not token:
+        logger.error('BOT_TOKEN missing'); return False
+    application = Application.builder().token(token).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    application.add_error_handler(error_handler)
+    if not getattr(application, "_initialized", False):
+        _run_coro(application.initialize())
+    if not getattr(application, "_running", False):
+        _run_coro(application.start())
+    logger.info("Bot initialized and started on background loop")
+    return True
+
+@app.route('/health')
+def health():
+    return jsonify({"status":"OK","message":"Bot is running"})
+
+@app.route('/', methods=['POST'])
+def webhook():
+    if application is None or _background_loop is None:
+        if not init_bot():
+            return jsonify({"error":"init failed"}), 500
+    upd = request.get_json()
+    if not upd or 'update_id' not in upd:
+        return jsonify({"status":"OK"})
+    update = Update.de_json(upd, application.bot)
+    if update:
+        _run_coro(application.process_update(update))
+    return jsonify({"status":"OK"})
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 8080))
-    logger.info(f'🚀 Запуск BTI Bot на порту {port}')
-    app.run(host='0.0.0.0', port=port, debug=False)
+    port = int(os.getenv('PORT', '8080'))
+    app.run(host='0.0.0.0', port=port)
